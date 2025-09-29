@@ -3,12 +3,16 @@ name: Deploy OAuth Service
 on:
   push:
     branches: [master]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'package*.json'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
-  API_NAME: oauth-service
-  STAGE: prod
+  API_NAME: rbios-oauth-api
 
 jobs:
   test:
@@ -31,19 +35,10 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
+    if: startsWith(github.ref, 'refs/heads/')
 
     steps:
     - uses: actions/checkout@v4
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '18'
-        cache: 'npm'
-
-    - name: Install dependencies
-      run: npm ci
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -52,176 +47,261 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    - name: Deploy Lambda functions
+    - name: Package OAuth Lambda functions
       run: |
-        echo "🚀 Deploying OAuth service to AWS Lambda..."
+        echo "📦 Packaging OAuth lambda..."
+        rm -rf /tmp/oauth-lambda
+        mkdir -p /tmp/oauth-lambda
 
-        # Create deployment package
-        npm run build:lambda
+        # Copy all source files
+        cp -r src/* /tmp/oauth-lambda/
 
-        # Function names
-        LOGIN_FN="${{ env.API_NAME }}-login"
-        CALLBACK_FN="${{ env.API_NAME }}-callback"
+        # Create package.json for Lambda
+        cat > /tmp/oauth-lambda/package.json << 'EOF'
+        {
+          "name": "rbios-oauth-service",
+          "version": "1.0.0",
+          "type": "module",
+          "dependencies": {
+            "node-fetch": "^3.3.2"
+          }
+        }
+        EOF
 
-        echo "📦 Deploying login function: $LOGIN_FN"
-        aws lambda create-function \
-          --function-name "$LOGIN_FN" \
-          --runtime nodejs18.x \
-          --role "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/lambda-execution-role" \
-          --handler "oauth-login.handler" \
-          --zip-file fileb://dist/oauth-login.zip \
-          --timeout 30 \
-          --memory-size 256 \
-          --environment "Variables={GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }},GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }},NODE_ENV=production,OAUTH_API_URL=https://api.rbios.net}" \
-          --publish || \
-        aws lambda update-function-code \
-          --function-name "$LOGIN_FN" \
-          --zip-file fileb://dist/oauth-login.zip && \
-        aws lambda update-function-configuration \
-          --function-name "$LOGIN_FN" \
-          --environment "Variables={GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }},GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }},NODE_ENV=production,OAUTH_API_URL=https://api.rbios.net}"
+        cd /tmp/oauth-lambda
+        zip -r /tmp/oauth-lambda.zip . -q
+        cd -
+        mv /tmp/oauth-lambda.zip oauth-lambda.zip
 
-        echo "📦 Deploying callback function: $CALLBACK_FN"
-        aws lambda create-function \
-          --function-name "$CALLBACK_FN" \
-          --runtime nodejs18.x \
-          --role "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/lambda-execution-role" \
-          --handler "oauth-callback.handler" \
-          --zip-file fileb://dist/oauth-callback.zip \
-          --timeout 30 \
-          --memory-size 256 \
-          --environment "Variables={GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }},GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }},NODE_ENV=production,OAUTH_API_URL=https://api.rbios.net}" \
-          --publish || \
-        aws lambda update-function-code \
-          --function-name "$CALLBACK_FN" \
-          --zip-file fileb://dist/oauth-callback.zip && \
-        aws lambda update-function-configuration \
-          --function-name "$CALLBACK_FN" \
-          --environment "Variables={GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }},GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }},NODE_ENV=production,OAUTH_API_URL=https://api.rbios.net}"
-
-    - name: Setup API Gateway
+    - name: Deploy OAuth Lambda and API routes
       run: |
-        echo "🌐 Setting up API Gateway..."
+        set -e
 
-        # Check if API exists
-        API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='${{ env.API_NAME }}'].ApiId" --output text)
+        # Debug: Check AWS CLI availability and version
+        echo "🔍 Checking AWS CLI setup..."
+        which aws || echo "AWS CLI not found in PATH"
+        aws --version || echo "AWS CLI version check failed"
+        aws sts get-caller-identity || echo "AWS credentials check failed"
 
-        if [ -z "$API_ID" ] || [ "$API_ID" = "None" ]; then
-          echo "Creating new API Gateway..."
-          API_ID=$(aws apigatewayv2 create-api \
-            --name "${{ env.API_NAME }}" \
-            --protocol-type HTTP \
-            --cors-configuration AllowOrigins="https://create.rbios.net,https://prompts.rbios.net",AllowMethods="GET,POST,OPTIONS",AllowHeaders="Content-Type,Authorization" \
-            --query ApiId --output text)
-          echo "Created API: $API_ID"
+        REGION="${{ env.AWS_REGION }}"
+        API_NAME="${{ env.API_NAME }}"
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+        LOGIN_FN="rbios-oauth-login"
+        CB_FN="rbios-oauth-callback"
+
+        # Determine branch and stage
+        BRANCH="${GITHUB_REF#refs/heads/}"
+        if [ "$BRANCH" = "master" ]; then
+          STAGE="prod"
+          USE_CUSTOM_DOMAIN=1
         else
-          echo "Using existing API: $API_ID"
+          # Sanitize branch for stage name
+          SANITIZED=$(echo "$BRANCH" | tr -c '[:alnum:]-' '-' | sed -E 's/^-+|-+$//g' | cut -c1-40)
+          STAGE="branch-$SANITIZED"
+          USE_CUSTOM_DOMAIN=0
         fi
 
-        # Function ARNs
-        LOGIN_ARN="arn:aws:lambda:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):function:${{ env.API_NAME }}-login"
-        CALLBACK_ARN="arn:aws:lambda:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):function:${{ env.API_NAME }}-callback"
+        echo "Using stage: $STAGE (branch: $BRANCH)"
 
-        # Helper function to create or update integration and route
-        upsert_integ_route() {
-          local method=$1
-          local path=$2
-          local function_arn=$3
-
-          # Create/update integration
-          INTEG_ID=$(aws apigatewayv2 get-integrations --api-id "$API_ID" --query "Items[?IntegrationUri=='$function_arn'].IntegrationId" --output text)
-          if [ -z "$INTEG_ID" ] || [ "$INTEG_ID" = "None" ]; then
-            INTEG_ID=$(aws apigatewayv2 create-integration \
-              --api-id "$API_ID" \
-              --integration-type AWS_PROXY \
-              --integration-uri "$function_arn" \
-              --payload-format-version "2.0" \
-              --query IntegrationId --output text)
-            echo "Created integration: $INTEG_ID for $path"
-          else
-            echo "Using existing integration: $INTEG_ID for $path"
-          fi
-
-          # Create/update route
-          ROUTE_KEY="$method $path"
-          ROUTE_ID=$(aws apigatewayv2 get-routes --api-id "$API_ID" --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId" --output text)
-          if [ -z "$ROUTE_ID" ] || [ "$ROUTE_ID" = "None" ]; then
-            aws apigatewayv2 create-route \
-              --api-id "$API_ID" \
-              --route-key "$ROUTE_KEY" \
-              --target "integrations/$INTEG_ID" > /dev/null
-            echo "Created route: $ROUTE_KEY"
-          else
-            aws apigatewayv2 update-route \
-              --api-id "$API_ID" \
-              --route-id "$ROUTE_ID" \
-              --target "integrations/$INTEG_ID" > /dev/null
-            echo "Updated route: $ROUTE_KEY"
-          fi
-
-          # Grant API Gateway permission to invoke Lambda
-          aws lambda add-permission \
-            --function-name "$function_arn" \
-            --statement-id "apigateway-invoke-$(echo $function_arn | cut -d: -f7)" \
-            --action lambda:InvokeFunction \
-            --principal apigateway.amazonaws.com \
-            --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):$API_ID/*/*" 2>/dev/null || true
+        # Helper: wait for Lambda to be Active/Successful
+        wait_for_function_ready() {
+          local FN_NAME=$1
+          local max_attempts=20
+          local attempt=1
+          local base_delay=2
+          while [ $attempt -le $max_attempts ]; do
+            local state=$(aws lambda get-function --function-name "$FN_NAME" --query 'Configuration.State' --output text 2>/dev/null || echo "NotFound")
+            local last=$(aws lambda get-function --function-name "$FN_NAME" --query 'Configuration.LastUpdateStatus' --output text 2>/dev/null || echo "Unknown")
+            if [ "$state" = "Active" ] && [ "$last" != "Failed" ]; then
+              echo "  • $FN_NAME ready (state=$state, last=$last, attempt $attempt/$max_attempts)";
+              return 0
+            fi
+            if [ "$state" = "Failed" ] || [ "$last" = "Failed" ]; then
+              echo "  ✗ $FN_NAME in failed state (state=$state, last=$last)";
+              return 1
+            fi
+            local delay=$((base_delay * (2 ** (attempt - 1))))
+            if [ $delay -gt 30 ]; then delay=30; fi
+            echo "  … waiting for $FN_NAME (state=$state, last=$last), sleeping ${delay}s"
+            sleep $delay
+            attempt=$((attempt + 1))
+          done
+          echo "  ✗ Timeout waiting for $FN_NAME to be ready"
+          return 1
         }
 
-        # Create integrations and routes
-        upsert_integ_route GET /oauth/login "$LOGIN_ARN"
-        upsert_integ_route GET /oauth/callback "$CALLBACK_ARN"
-
-        # Create/update stage
-        STAGE_NAME="${{ env.STAGE }}"
-        aws apigatewayv2 create-stage \
-          --api-id "$API_ID" \
-          --stage-name "$STAGE_NAME" \
-          --auto-deploy 2>/dev/null || \
-        aws apigatewayv2 update-stage \
-          --api-id "$API_ID" \
-          --stage-name "$STAGE_NAME" \
-          --auto-deploy
-
-        # Setup custom domain
-        CUSTOM_DOMAIN="api.rbios.net"
-        echo "🌍 Setting up custom domain: $CUSTOM_DOMAIN"
-
-        # Check if domain already exists
-        DOMAIN_EXISTS=$(aws apigatewayv2 get-domain-names --query "Items[?DomainName=='$CUSTOM_DOMAIN'].DomainName" --output text)
-
-        if [ -z "$DOMAIN_EXISTS" ] || [ "$DOMAIN_EXISTS" = "None" ]; then
-          # Find SSL certificate
-          CERT_ARN=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[?DomainName=='*.rbios.net' || DomainName=='rbios.net'].CertificateArn" --output text | head -1)
-
-          if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
-            aws apigatewayv2 create-domain-name \
-              --domain-name "$CUSTOM_DOMAIN" \
-              --domain-name-configurations CertificateArn="$CERT_ARN"
-            echo "Created custom domain: $CUSTOM_DOMAIN"
-          else
-            echo "⚠️  No SSL certificate found for rbios.net domain"
-          fi
-        else
-          echo "Custom domain already exists: $CUSTOM_DOMAIN"
+        # Create or get API Gateway
+        echo "🔧 Setting up API Gateway..."
+        API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='$API_NAME'].ApiId" --output text)
+        if [ -z "$API_ID" ] || [ "$API_ID" = "None" ]; then
+          API_ID=$(aws apigatewayv2 create-api \
+            --name $API_NAME \
+            --protocol-type HTTP \
+            --cors-configuration AllowOrigins="https://create.rbios.net,https://prompts.rbios.net,http://localhost:5173,http://localhost:5174",AllowMethods="GET,OPTIONS",AllowHeaders="Content-Type,Authorization",AllowCredentials=true \
+            --query 'ApiId' --output text)
         fi
 
-        # Create API mapping for oauth paths
-        aws apigatewayv2 create-api-mapping \
-          --domain-name "$CUSTOM_DOMAIN" \
-          --api-id "$API_ID" \
-          --stage "$STAGE_NAME" \
-          --api-mapping-key "oauth" 2>/dev/null || \
-        echo "API mapping may already exist"
+        API_URL="https://$API_ID.execute-api.$REGION.amazonaws.com/$STAGE"
 
-        # Output URLs
-        API_URL="https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/$STAGE_NAME"
-        CUSTOM_URL="https://$CUSTOM_DOMAIN/oauth"
+        # Use custom domain for production, direct API URL for branches
+        if [ "$USE_CUSTOM_DOMAIN" = "1" ]; then
+          OAUTH_API_URL="https://api.rbios.net"
+        else
+          OAUTH_API_URL="$API_URL"
+        fi
 
-        echo "✅ Deployment complete!"
-        echo "Direct API URL: $API_URL"
-        echo "Custom domain URL: $CUSTOM_URL"
-        echo ""
-        echo "OAuth endpoints:"
-        echo "- Login: $CUSTOM_URL/login?project=create"
-        echo "- Callback: $CUSTOM_URL/callback"
+        # Create or update functions
+        upsert_fn() {
+          local FN_NAME=$1
+          local HANDLER=$2
+
+          if aws lambda get-function --function-name "$FN_NAME" > /dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FN_NAME" --zip-file fileb://oauth-lambda.zip > /dev/null
+          else
+            aws lambda create-function \
+              --function-name "$FN_NAME" \
+              --runtime nodejs20.x \
+              --role arn:aws:iam::$ACCOUNT_ID:role/lambda-execution-role \
+              --handler $HANDLER \
+              --zip-file fileb://oauth-lambda.zip \
+              --timeout 30 \
+              --memory-size 256 > /dev/null
+          fi
+
+          # Wait for function to be Active before updating configuration
+          wait_for_function_ready "$FN_NAME"
+
+          aws lambda update-function-configuration \
+            --function-name "$FN_NAME" \
+            --environment "Variables={GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }},GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }},NODE_ENV=production,OAUTH_API_URL=$OAUTH_API_URL}" > /dev/null
+
+          # Wait again after configuration update
+          wait_for_function_ready "$FN_NAME"
+
+          # Allow API Gateway invoke
+          aws lambda add-permission \
+            --function-name "$FN_NAME" \
+            --statement-id "allow-apigw-${FN_NAME}" \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:$REGION:$ACCOUNT_ID:$API_ID/*" > /dev/null 2>&1 || true
+        }
+
+        # Create stage (idempotent)
+        aws apigatewayv2 create-stage --api-id "$API_ID" --stage-name "$STAGE" --auto-deploy > /dev/null 2>&1 || true
+
+        upsert_fn "$LOGIN_FN" "handlers/oauth-login.handler"
+        upsert_fn "$CB_FN" "handlers/oauth-callback.handler"
+
+        # Create or update integrations and routes (idempotent)
+        upsert_integ_route() {
+          local METHOD=$1
+          local PATH=$2
+          local FN_NAME=$3
+          local ROUTE_KEY="$METHOD $PATH"
+          local INTEGRATION_URI="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FN_NAME"
+
+          # Check if route already exists
+          EXISTING_ROUTE_ID=$(aws apigatewayv2 get-routes --api-id "$API_ID" --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId" --output text 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_ROUTE_ID" ] && [ "$EXISTING_ROUTE_ID" != "None" ]; then
+            echo "  Route $ROUTE_KEY already exists ($EXISTING_ROUTE_ID), checking integration..."
+
+            # Get existing integration ID from route
+            EXISTING_TARGET=$(aws apigatewayv2 get-route --api-id "$API_ID" --route-id "$EXISTING_ROUTE_ID" --query "Target" --output text 2>/dev/null || echo "")
+            EXISTING_INTEGRATION_ID="${EXISTING_TARGET#integrations/}"
+
+            if [ -n "$EXISTING_INTEGRATION_ID" ] && [ "$EXISTING_INTEGRATION_ID" != "None" ]; then
+              # Check if integration URI is correct
+              CURRENT_URI=$(aws apigatewayv2 get-integration --api-id "$API_ID" --integration-id "$EXISTING_INTEGRATION_ID" --query "IntegrationUri" --output text 2>/dev/null || echo "")
+
+              if [ "$CURRENT_URI" = "$INTEGRATION_URI" ]; then
+                echo "  Integration already correct, skipping"
+                return 0
+              else
+                echo "  Integration URI incorrect ($CURRENT_URI vs $INTEGRATION_URI), updating..."
+                aws apigatewayv2 update-integration --api-id "$API_ID" --integration-id "$EXISTING_INTEGRATION_ID" --integration-uri "$INTEGRATION_URI" > /dev/null 2>&1 || true
+                return 0
+              fi
+            fi
+          fi
+
+          # Create new integration
+          echo "  Creating new integration for $ROUTE_KEY..."
+          INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+            --api-id "$API_ID" \
+            --integration-type AWS_PROXY \
+            --integration-uri "$INTEGRATION_URI" \
+            --payload-format-version 2.0 \
+            --query 'IntegrationId' --output text)
+
+          # Delete existing route if exists (to replace with new integration)
+          if [ -n "$EXISTING_ROUTE_ID" ] && [ "$EXISTING_ROUTE_ID" != "None" ]; then
+            aws apigatewayv2 delete-route --api-id "$API_ID" --route-id "$EXISTING_ROUTE_ID" > /dev/null 2>&1 || true
+          fi
+
+          # Create new route
+          aws apigatewayv2 create-route --api-id "$API_ID" --route-key "$ROUTE_KEY" --target "integrations/$INTEGRATION_ID" > /dev/null
+          echo "  Created route $ROUTE_KEY with integration $INTEGRATION_ID"
+        }
+
+        upsert_integ_route GET /oauth/login "$LOGIN_FN"
+        upsert_integ_route GET /oauth/callback "$CB_FN"
+
+        if [ "$USE_CUSTOM_DOMAIN" = "1" ]; then
+          # Custom domain mapping for master only
+          CUSTOM_DOMAIN="api.rbios.net"
+          echo "Looking for SSL certificate for $CUSTOM_DOMAIN..."
+
+          # Check if AWS CLI is available and properly configured
+          if ! command -v aws &> /dev/null; then
+            echo "⚠️  AWS CLI not found, skipping custom domain setup"
+            echo "✅ OAuth endpoints (master) deployed at $API_URL"
+          else
+            CERT_ARN=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[?DomainName=='*.rbios.net' || DomainName=='rbios.net'].CertificateArn" --output text 2>/dev/null | head -n1 || echo "")
+
+            if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ] && [ "$CERT_ARN" != "" ]; then
+              echo "Found certificate: $CERT_ARN"
+              aws apigatewayv2 create-domain-name --domain-name "$CUSTOM_DOMAIN" --domain-name-configurations CertificateArn="$CERT_ARN" > /dev/null 2>&1 || true
+              sleep 5
+              aws apigatewayv2 create-api-mapping --domain-name "$CUSTOM_DOMAIN" --api-id "$API_ID" --stage "$STAGE" --api-mapping-key "oauth" > /dev/null 2>&1 || true
+              echo "✅ OAuth endpoints (master) deployed at https://$CUSTOM_DOMAIN/oauth"
+            else
+              echo "⚠️  No SSL certificate found for $CUSTOM_DOMAIN, using API Gateway URL"
+              echo "✅ OAuth endpoints (master) deployed at $API_URL"
+            fi
+          fi
+        else
+          echo "✅ OAuth endpoints (branch) deployed at $API_URL"
+        fi
+
+    - name: Cleanup
+      run: rm -f oauth-lambda.zip
+
+  notify:
+    needs: [test, deploy]
+    runs-on: ubuntu-latest
+    if: always() && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+
+    steps:
+    - name: Deployment Summary
+      run: |
+        echo "🚀 OAuth Service Deployment Summary"
+        echo "================================="
+        echo "🌐 Target URL: https://api.rbios.net/oauth"
+        echo "🌍 Region: ${{ env.AWS_REGION }}"
+        echo "📊 Status: ${{ needs.deploy.result }}"
+
+        if [ "${{ needs.deploy.result }}" = "success" ]; then
+          echo "✅ OAuth service deployment completed successfully!"
+          echo "🎉 Service is now live!"
+          echo ""
+          echo "Available endpoints:"
+          echo "- Login: https://api.rbios.net/oauth/login?project=create"
+          echo "- Login: https://api.rbios.net/oauth/login?project=prompts"
+          echo "- Callback: https://api.rbios.net/oauth/callback"
+        else
+          echo "❌ Deployment failed"
+          echo "🔍 Check the deployment logs for details"
+        fi
