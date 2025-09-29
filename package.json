@@ -1,0 +1,41 @@
+{
+  "name": "oauth-service",
+  "version": "1.0.0",
+  "description": "Shared OAuth service for rbios projects",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node local/server.js",
+    "test": "node --test test/**/*.test.js",
+    "build": "npm run build:lambda",
+    "build:lambda": "node scripts/build-lambda.js",
+    "deploy": "npm run build && npm run deploy:lambda",
+    "deploy:lambda": "node scripts/deploy.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rjmette/oauth-service.git"
+  },
+  "keywords": [
+    "oauth",
+    "github",
+    "authentication",
+    "serverless",
+    "aws-lambda"
+  ],
+  "author": "rjmette",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/rjmette/oauth-service/issues"
+  },
+  "homepage": "https://github.com/rjmette/oauth-service#readme",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  }
+}
